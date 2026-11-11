@@ -1,0 +1,59 @@
+---
+- name: Check persistent client registry
+  ansible.builtin.stat:
+    path: /etc/amnezia/amneziawg/cascade-clients.json
+  register: awg_registry_file
+- name: Read persistent client registry
+  ansible.builtin.slurp:
+    src: /etc/amnezia/amneziawg/cascade-clients.json
+  when: awg_registry_file.stat.exists
+  register: awg_registry_raw
+- name: Load dynamic peers and persistent revocations
+  ansible.builtin.set_fact:
+    awg_registry: "{{ (awg_registry_raw.content | b64decode | from_json) if awg_registry_file.stat.exists else {'clients': [], 'removed': []} }}"
+- name: Select effective inventory peers
+  ansible.builtin.set_fact:
+    awg_dynamic_clients: '{{ awg_registry.clients }}'
+    awg_removed_clients: '{{ awg_registry.removed }}'
+    awg_inventory_clients: "{{ awg_clients | rejectattr('name', 'in', awg_registry.removed + (awg_registry.clients | map(attribute='name') | list)) | list }}"
+- name: Validate combined address and name allocation
+  ansible.builtin.assert:
+    that:
+      - combined | map(attribute='name') | unique | length == combined | length
+      - combined | map(attribute='octet') | map('int') | unique | length == combined | length
+    fail_msg: Inventory and script-created clients have conflicting addresses; choose a free inventory octet.
+  vars:
+    combined: '{{ awg_inventory_clients + awg_dynamic_clients }}'
+- name: Validate dynamic clients
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[A-Za-z0-9_-]{1,32}$')
+      - item.octet | int >= 2
+      - item.octet | int <= 254
+      - item.public_key is match('^[A-Za-z0-9+/]{43}=$')
+  loop: '{{ awg_dynamic_clients }}'
+- name: Read private keys of dynamically created clients
+  ansible.builtin.slurp:
+    src: '/etc/amnezia/amneziawg/cascade-keys/client-{{ item.name }}.key'
+  loop: '{{ awg_dynamic_clients }}'
+  register: awg_dynamic_keys
+  no_log: true
+- name: Check dynamic key pairs
+  ansible.builtin.command:
+    argv: [awg, pubkey]
+    stdin: '{{ item.content | b64decode | trim }}'
+  loop: '{{ awg_dynamic_keys.results }}'
+  register: awg_dynamic_public
+  changed_when: false
+  failed_when: awg_dynamic_public.stdout | trim != item.item.public_key
+  no_log: true
+- name: Index dynamic keys for client profile refresh
+  ansible.builtin.set_fact:
+    awg_private_keys: "{{ awg_private_keys | combine({'client-' + item.item.name: item.content | b64decode | trim}) }}"
+  loop: '{{ awg_dynamic_keys.results }}'
+  no_log: true
+- name: Save settings used by client management scripts
+  ansible.builtin.copy:
+    content: "{{ {'interface': awg_client_interface, 'endpoint': hostvars[awg_gate].ansible_host, 'dns': awg_dns} | to_nice_json }}"
+    dest: /etc/amnezia/amneziawg/cascade-settings.json
+    mode: '0600'

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# All rules belong only to this interface. Never flush global routing/firewall.
+action=${1:?up or down}
+[[ $action == up || $action == down ]] || exit 2
+ipt() { iptables -w 10 "$@"; }
+# Reverse path to an internet source is WAN; replies arrive on the AWG link.
+if [[ $action == up ]]; then
+    sysctl -w net.ipv4.conf.{{ item }}.rp_filter=2 >/dev/null
+fi
+{% if awg_node_role == 'gate' and item == awg_client_interface %}
+chain=AWGC_CLIENTS
+if [[ $action == up ]]; then
+    ipt -N "$chain" 2>/dev/null || true
+    ipt -F "$chain"
+    ipt -A "$chain" -i {{ item }} -d {{ awg_link_subnet }}.0/30 -j DROP
+    ipt -A "$chain" -i {{ item }} -o {{ awg_gate_link_interface }} -s {{ awg_client_subnet }}.0/24 -j ACCEPT
+    ipt -A "$chain" -i {{ awg_gate_link_interface }} -o {{ item }} -d {{ awg_client_subnet }}.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+{% if awg_ru_split %}
+    ipt -A "$chain" -i {{ item }} -o {{ awg_wan }} -s {{ awg_client_subnet }}.0/24 -m mark --mark 0x64 -j ACCEPT
+    ipt -A "$chain" -i {{ awg_wan }} -o {{ item }} -d {{ awg_client_subnet }}.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+{% endif %}
+    ipt -A "$chain" -i {{ item }} -j DROP
+    ipt -A "$chain" -o {{ item }} -j DROP
+    ipt -C FORWARD -j "$chain" 2>/dev/null || ipt -I FORWARD 1 -j "$chain"
+    ipt -I INPUT -p udp --dport {{ awg_client_port }} -j ACCEPT
+    # Remains when the link is down, preventing fallback to gate's main table.
+    ip route replace unreachable default metric 32760 table {{ awg_route_table }}
+    ip rule add from {{ awg_client_subnet }}.0/24 iif {{ item }} priority 10010 lookup {{ awg_route_table }}
+{% if awg_ru_split %}
+    /usr/local/sbin/awg-cascade-ru-routes --apply
+    ip route replace default via {{ awg_gateway }} dev {{ awg_wan }} onlink table {{ awg_ru_table }}
+    ip rule add from {{ awg_client_subnet }}.0/24 iif {{ item }} fwmark 0x64 priority 10000 lookup {{ awg_ru_table }}
+    ipt -t nat -A POSTROUTING -s {{ awg_client_subnet }}.0/24 -o {{ awg_wan }} -j MASQUERADE
+{% endif %}
+else
+    ip rule del from {{ awg_client_subnet }}.0/24 iif {{ item }} priority 10010 lookup {{ awg_route_table }} 2>/dev/null || true
+    ip route del unreachable default metric 32760 table {{ awg_route_table }} 2>/dev/null || true
+{% if awg_ru_split %}
+    ip rule del from {{ awg_client_subnet }}.0/24 iif {{ item }} fwmark 0x64 priority 10000 lookup {{ awg_ru_table }} 2>/dev/null || true
+    ip route del default via {{ awg_gateway }} dev {{ awg_wan }} table {{ awg_ru_table }} 2>/dev/null || true
+    ipt -t nat -D POSTROUTING -s {{ awg_client_subnet }}.0/24 -o {{ awg_wan }} -j MASQUERADE || true
+    nft delete table inet awg_cascade_split 2>/dev/null || true
+{% endif %}
+    ipt -D INPUT -p udp --dport {{ awg_client_port }} -j ACCEPT || true
+    ipt -D FORWARD -j "$chain" || true
+    ipt -F "$chain" || true
+    ipt -X "$chain" || true
+fi
+{% elif awg_node_role == 'gate' %}
+if [[ $action == up ]]; then
+    ip route replace default dev {{ item }} metric 10 table {{ awg_route_table }}
+    ipt -I INPUT -p udp --dport {{ awg_gate_link_port }} -j ACCEPT
+    ipt -t nat -A POSTROUTING -s {{ awg_client_subnet }}.0/24 -o {{ item }} -j MASQUERADE
+else
+    ip route del default dev {{ item }} metric 10 table {{ awg_route_table }} 2>/dev/null || true
+    ipt -D INPUT -p udp --dport {{ awg_gate_link_port }} -j ACCEPT || true
+    ipt -t nat -D POSTROUTING -s {{ awg_client_subnet }}.0/24 -o {{ item }} -j MASQUERADE || true
+fi
+{% else %}
+if [[ $action == up ]]; then
+    ipt -I INPUT -p udp --dport {{ awg_hub_port }} -j ACCEPT
+    ipt -I FORWARD -i {{ item }} -o {{ awg_wan }} -s {{ awg_link_subnet }}.2/32 -j ACCEPT
+    ipt -I FORWARD -i {{ awg_wan }} -o {{ item }} -d {{ awg_link_subnet }}.2/32 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt -t nat -A POSTROUTING -s {{ awg_link_subnet }}.2/32 -o {{ awg_wan }} -j MASQUERADE
+else
+    ipt -D INPUT -p udp --dport {{ awg_hub_port }} -j ACCEPT || true
+    ipt -D FORWARD -i {{ item }} -o {{ awg_wan }} -s {{ awg_link_subnet }}.2/32 -j ACCEPT || true
+    ipt -D FORWARD -i {{ awg_wan }} -o {{ item }} -d {{ awg_link_subnet }}.2/32 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+    ipt -t nat -D POSTROUTING -s {{ awg_link_subnet }}.2/32 -o {{ awg_wan }} -j MASQUERADE || true
+fi
+{% endif %}

@@ -1,0 +1,21 @@
+# shared configuration for both vps
+---
+all:
+  vars:
+    ansible_user: root
+    ansible_ssh_private_key_file: ~/.ssh/infra_key
+    awg_gate_link_public_key: ''  # from gate.yml --tags prepare
+    awg_hub_link_public_key: ''   # from hub.yml --tags prepare
+    awg_ru_split: true
+    awg_clients:
+      - {name: testcfg1, octet: 2}
+      - {name: testcfg2, octet: 3}
+  children:
+    awg_gate:
+      hosts:
+        gate_ru:
+          ansible_host: 203.0.113.10  # replace: gate(ru) vps
+    awg_hub:
+      hosts:
+        hub_de:
+          ansible_host: 203.0.113.20  # replace: hub vps

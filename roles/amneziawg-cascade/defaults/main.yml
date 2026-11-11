@@ -1,0 +1,40 @@
+---
+awg_client_interface: awg0
+awg_gate_link_interface: awg1
+awg_hub_interface: awg2
+awg_client_port: 51820
+awg_gate_link_port: 51822
+awg_hub_port: 51821
+awg_client_subnet: 10.2.0
+awg_link_subnet: 10.78.0
+awg_mtu: 1280
+awg_dns: 1.1.1.1
+awg_route_table: 10010
+awg_ru_table: 10011
+awg_ru_split: true
+awg_ru_extra: []
+awg_clients:
+  - {name: phone, octet: 2}
+awg_entry_obfuscation:
+  Jc: 4
+  Jmin: 40
+  Jmax: 70
+  S1: 30
+  S2: 40
+  H1: 1234567891
+  H2: 1234567892
+  H3: 1234567893
+  H4: 1234567894
+awg_link_obfuscation:
+  Jc: 6
+  Jmin: 8
+  Jmax: 80
+  S1: 21
+  S2: 126
+  H1: 664839111
+  H2: 1485638111
+  H3: 1457145111
+  H4: 1956374111
+# Fill with the link public keys printed by --tags prepare on each node.
+awg_gate_link_public_key: ''
+awg_hub_link_public_key: ''

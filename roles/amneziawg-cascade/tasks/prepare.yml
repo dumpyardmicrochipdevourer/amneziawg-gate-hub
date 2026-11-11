@@ -1,0 +1,160 @@
+---
+- name: Validate two-node inventory
+  ansible.builtin.assert:
+    that:
+      - groups.get('awg_gate', []) | length == 1
+      - groups.get('awg_hub', []) | length == 1
+      - groups['awg_gate'][0] != groups['awg_hub'][0]
+      - hostvars[groups['awg_gate'][0]].ansible_host != hostvars[groups['awg_hub'][0]].ansible_host
+- name: Validate platform and settings
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Ubuntu'
+      - ansible_facts.distribution_version in ['22.04', '24.04']
+      - ansible_facts.architecture == 'x86_64'
+      - ansible_facts.virtualization_type not in ['lxc', 'openvz', 'docker', 'container']
+      - awg_client_subnet is match('^10\.[0-9]{1,3}\.[0-9]{1,3}$')
+      - awg_link_subnet is match('^10\.[0-9]{1,3}\.[0-9]{1,3}$')
+      - awg_client_subnet != awg_link_subnet
+      - awg_route_table | int >= 10000
+      - awg_ru_table | int >= 10000
+      - awg_route_table != awg_ru_table
+      - awg_clients | map(attribute='name') | unique | length == awg_clients | length
+      - awg_clients | map(attribute='octet') | map('int') | unique | length == awg_clients | length
+- name: Validate subnet octets
+  ansible.builtin.assert:
+    that:
+      - item | int >= 0
+      - item | int <= 255
+  loop: "{{ awg_client_subnet.split('.')[1:] + awg_link_subnet.split('.')[1:] }}"
+- name: Validate clients
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[A-Za-z0-9_-]{1,32}$')
+      - item.octet | int >= 2
+      - item.octet | int <= 254
+      - item.octet | string == item.octet | int | string
+  loop: '{{ awg_clients }}'
+- name: Validate interface names
+  ansible.builtin.assert:
+    that:
+      - item is match('^[A-Za-z][A-Za-z0-9_-]{0,14}$')
+  loop: '{{ [awg_client_interface, awg_gate_link_interface, awg_hub_interface] }}'
+- name: Validate ports and separate gate interfaces
+  ansible.builtin.assert:
+    that:
+      - awg_client_interface != awg_gate_link_interface
+      - awg_client_port | int != awg_gate_link_port | int
+      - item | int >= 1
+      - item | int <= 65535
+  loop: '{{ [awg_client_port, awg_gate_link_port, awg_hub_port] }}'
+- name: Select outbound interface and node names
+  ansible.builtin.set_fact:
+    awg_wan: '{{ awg_egress_interface | default(ansible_facts.default_ipv4.interface) }}'
+    awg_gateway: '{{ awg_egress_gateway | default(ansible_facts.default_ipv4.gateway) }}'
+    awg_gate: "{{ groups['awg_gate'][0] }}"
+    awg_hub: "{{ groups['awg_hub'][0] }}"
+- name: Validate network arguments
+  ansible.builtin.assert:
+    that:
+      - awg_wan is match('^[A-Za-z0-9_.:-]{1,15}$')
+      - awg_wan not in [awg_client_interface, awg_gate_link_interface, awg_hub_interface]
+      - awg_gateway is match('^[0-9.]+$')
+      - hostvars[awg_gate].ansible_host is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+      - hostvars[awg_hub].ansible_host is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+- name: Install kernel build prerequisites
+  ansible.builtin.apt:
+    name:
+      - software-properties-common
+      - python3-launchpadlib
+      - gnupg
+      - build-essential
+      - dkms
+      - "linux-headers-{{ ansible_facts.kernel }}"
+      - iptables
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable Ubuntu sources for DKMS kernel source lookup
+  ansible.builtin.apt_repository:
+    repo: "deb-src http://archive.ubuntu.com/ubuntu {{ ansible_facts.distribution_release }}{{ item }} main restricted universe multiverse"
+    filename: awg-cascade-sources
+    state: present
+  loop: ['', '-updates', '-security']
+
+- name: Add official Amnezia PPA
+  ansible.builtin.apt_repository:
+    repo: ppa:amnezia/ppa
+    state: present
+
+- name: Install AWG module and tools (requires a real run)
+  when: not ansible_check_mode
+  block:
+    - name: Install AmneziaWG kernel module and tools
+      ansible.builtin.apt:
+        name: [amneziawg, amneziawg-tools]
+        state: present
+        update_cache: true
+
+    - name: Load module and fail early if DKMS or Secure Boot prevents loading
+      ansible.builtin.command: modprobe amneziawg
+      changed_when: false
+
+
+    - name: Install routing prerequisites
+      ansible.builtin.apt:
+        name: [curl, python3, nftables, iproute2]
+        state: present
+    - name: Create private directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        mode: '0700'
+      loop:
+        - /etc/amnezia/amneziawg
+        - /etc/amnezia/amneziawg/cascade-keys
+        - /etc/amnezia/amneziawg/cascade-clients
+        - /var/lib/awg-cascade
+    - name: Generate persistent node and client keys
+      ansible.builtin.shell: |
+        set -eu
+        umask 077
+        awg genkey > {{ ('/etc/amnezia/amneziawg/cascade-keys/' + item + '.key') | quote }}
+      args:
+        creates: '/etc/amnezia/amneziawg/cascade-keys/{{ item }}.key'
+      loop: "{{ ['link'] + (['entry'] + (awg_clients | map(attribute='name') | map('regex_replace', '^', 'client-') | list) if inventory_hostname in groups['awg_gate'] else []) }}"
+      no_log: true
+    - name: Read persistent keys
+      ansible.builtin.slurp:
+        src: '/etc/amnezia/amneziawg/cascade-keys/{{ item }}.key'
+      loop: "{{ ['link'] + (['entry'] + (awg_clients | map(attribute='name') | map('regex_replace', '^', 'client-') | list) if inventory_hostname in groups['awg_gate'] else []) }}"
+      register: awg_keys_raw
+      no_log: true
+    - name: Derive public keys
+      ansible.builtin.command:
+        argv: [awg, pubkey]
+        stdin: '{{ item.content | b64decode | trim }}'
+      loop: '{{ awg_keys_raw.results }}'
+      register: awg_public_raw
+      changed_when: false
+      no_log: true
+    - name: Index keys for rendering
+      ansible.builtin.set_fact:
+        awg_private_keys: "{{ awg_private_keys | default({}) | combine({item.item: item.content | b64decode | trim}) }}"
+        awg_public_keys: "{{ awg_public_keys | default({}) | combine({item.item: awg_public_raw.results[idx].stdout | trim}) }}"
+      loop: '{{ awg_keys_raw.results }}'
+      loop_control:
+        index_var: idx
+      no_log: true
+    - name: Enable persistent forwarding
+      ansible.builtin.copy:
+        content: "net.ipv4.ip_forward = 1\n"
+        dest: /etc/sysctl.d/91-awg-cascade.conf
+        mode: '0644'
+    - name: Read forwarding state
+      ansible.builtin.command: sysctl -n net.ipv4.ip_forward
+      register: awg_forwarding
+      changed_when: false
+    - name: Apply forwarding
+      ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+      when: awg_forwarding.stdout | trim != '1'

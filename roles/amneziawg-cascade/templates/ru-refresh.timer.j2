@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily RU prefixes refresh for AWG cascade
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

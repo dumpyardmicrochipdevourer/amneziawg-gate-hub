@@ -1,0 +1,15 @@
+[Interface]
+PrivateKey = {{ awg_private_keys['client-' + item.name] }}
+Address = {{ awg_client_subnet }}.{{ item.octet }}/32
+DNS = {{ awg_dns }}
+MTU = {{ awg_mtu }}
+{% for key, value in awg_entry_obfuscation.items() %}
+{{ key }} = {{ value }}
+{% endfor %}
+
+[Peer]
+PublicKey = {{ awg_public_keys['entry'] }}
+Endpoint = {{ hostvars[awg_gate].ansible_host }}:{{ awg_client_port }}
+# IPv6 captured to prevent bypass; this deployment routes IPv4 only.
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25

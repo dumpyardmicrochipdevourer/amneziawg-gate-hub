@@ -1,0 +1,137 @@
+#!/bin/bash
+# Наполняет nft-множества, по которым awg0 разделяет трафик клиентов:
+# российские адреса уходят напрямую через московский eth0, остальное — в хаб.
+#
+# Раньше список жил прямо в awg0-postup.sh — 66 маршрутов, дописываемых руками
+# по жалобам. Четыре из них были надсетями (/16), заметно шире реальных
+# российских выделений: через Москву уходил британский, турецкий, немецкий и
+# польский трафик. RIPE-список покрывает те же сервисы точнее.
+#
+# Режимы:
+#   --refresh  (по умолчанию) скачать RIPE, пересобрать ruleset, применить
+#   --apply    применить последний сохранённый ruleset, в сеть не ходить
+#
+# --apply вызывается из awg0-postup.sh: PostUp блокирует старт интерфейса,
+# и ходить оттуда в сеть нельзя.
+set -euo pipefail
+
+RIPE_URL="${RIPE_URL:-https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest}"
+EXTRA_LIST="${EXTRA_LIST:-/etc/amnezia/amneziawg/cascade-ru-extra.list}"
+STATE_DIR="${STATE_DIR:-/var/lib/awg-cascade}"
+RULESET="${STATE_DIR}/awg_cascade_split.nft"
+
+# Ниже этого числа префиксов считаем, что источник отдал обрезанный ответ,
+# и отказываемся применять: пустое множество означает, что весь российский
+# трафик молча уедет в Германию, а это ровно та поломка, от которой уходим.
+MIN_PREFIXES="${MIN_PREFIXES:-5000}"
+
+MODE="${1:---refresh}"
+
+case "$MODE" in
+    --refresh|--apply) ;;
+    *) echo "Использование: $0 [--refresh|--apply]" >&2; exit 2 ;;
+esac
+
+if [ "$MODE" = "--apply" ]; then
+    if [ ! -s "$RULESET" ]; then
+        echo "$RULESET отсутствует — нечего применять, пропускаю" >&2
+        exit 0
+    fi
+    nft -f "$RULESET"
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+curl --fail --silent --show-error --location --max-time 120 \
+     --output "$TMP_DIR/delegated" "$RIPE_URL"
+
+# Диапазоны в файле RIR заданы как «начало + количество адресов», причём
+# количество не обязано быть степенью двойки: 1.2.3.0 + 768 это /24 плюс /23.
+# summarize_address_range раскладывает такой диапазон в корректный набор CIDR.
+python3 - "$TMP_DIR/delegated" "$TMP_DIR/ru_v4" <<'PY'
+import ipaddress
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+nets = []
+with open(src, encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        # rstrip обязателен: без него последнее поле приезжает как "allocated\n"
+        # и сравнение со статусом не срабатывает — отбрасывается весь файл.
+        f = line.rstrip("\n").split("|")
+        # ripencc|RU|ipv4|<start>|<count>|<date>|<status>
+        if len(f) < 7 or f[1] != "RU" or f[2] != "ipv4":
+            continue
+        if f[6] not in ("allocated", "assigned"):
+            continue
+        start = ipaddress.IPv4Address(f[3])
+        nets.extend(ipaddress.summarize_address_range(start, start + int(f[4]) - 1))
+
+with open(dst, "w", encoding="utf-8") as out:
+    for net in ipaddress.collapse_addresses(nets):
+        out.write(f"{net}\n")
+PY
+
+COUNT=$(grep -c . "$TMP_DIR/ru_v4" || true)
+if [ "$COUNT" -lt "$MIN_PREFIXES" ]; then
+    echo "Получено всего $COUNT префиксов (порог $MIN_PREFIXES) — источник подозрительный." >&2
+    echo "Текущее множество не трогаю." >&2
+    exit 1
+fi
+
+# Ручные исключения: адреса, не числящиеся за RU в RIR, но которые всё равно
+# должны ходить напрямую. Комментарии и пустые строки отбрасываем.
+: > "$TMP_DIR/ru_extra"
+if [ -f "$EXTRA_LIST" ]; then
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' "$EXTRA_LIST" | grep -v '^$' > "$TMP_DIR/ru_extra" || true
+fi
+
+emit_set() {
+    local name="$1" file="$2"
+    printf '\tset %s {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n' "$name"
+    # elements = { } — синтаксическая ошибка, поэтому пустое множество
+    # объявляем вовсе без elements.
+    if [ -s "$file" ]; then
+        printf '\t\telements = {\n'
+        # По одному элементу на строку. Раньше здесь был `paste -sd, | fold -w 120`,
+        # но fold режет строго по колонке, а в списке нет пробелов — префиксы
+        # рвались пополам (2.57.184.0/22 → "2" + ".57.184.0/22") и nft не парсил.
+        sed -e 's/^/\t\t\t/' -e 's/$/,/' "$file" | sed '$ s/,$//'
+        printf '\t\t}\n'
+    fi
+    printf '\t}\n'
+}
+
+{
+    # add + delete перед определением: delete на несуществующей таблице — ошибка,
+    # а add на существующей безвреден. Весь файл nft применяет одной транзакцией,
+    # поэтому окна с пустым множеством не возникает.
+    printf 'add table inet awg_cascade_split\n'
+    printf 'delete table inet awg_cascade_split\n'
+    printf 'table inet awg_cascade_split {\n'
+    emit_set ru_v4 "$TMP_DIR/ru_v4"
+    emit_set ru_extra "$TMP_DIR/ru_extra"
+    printf '\tchain mark_ru {\n'
+    printf '\t\ttype filter hook prerouting priority mangle; policy accept;\n'
+    printf '\t\tiifname != "{{ awg_client_interface }}" return\n'
+    # counter — единственный способ увидеть, что разделение вообще работает:
+    # `nft list chain inet awg_cascade_split mark_ru` покажет, сколько пакетов ушло
+    # напрямую в Москву. Счётчики обнуляются при пересборке множеств.
+    printf '\t\tip daddr @ru_v4 counter meta mark set 0x64\n'
+    printf '\t\tip daddr @ru_extra counter meta mark set 0x64\n'
+    printf '\t}\n'
+    printf '}\n'
+} > "$TMP_DIR/awg_cascade_split.nft"
+
+nft -c -f "$TMP_DIR/awg_cascade_split.nft"
+nft -f "$TMP_DIR/awg_cascade_split.nft"
+
+# Сохраняем только после успешного применения, иначе --apply на следующем
+# старте интерфейса поднимет заведомо битый ruleset.
+mv "$TMP_DIR/awg_cascade_split.nft" "$RULESET"
+
+echo "Применено: ru_v4=$COUNT, ru_extra=$(grep -c . "$TMP_DIR/ru_extra" || true)"

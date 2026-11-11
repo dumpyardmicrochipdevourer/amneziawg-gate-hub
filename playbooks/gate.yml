@@ -1,0 +1,67 @@
+---
+- name: Configure Russian gate only
+  hosts: awg_gate
+  become: true
+  any_errors_fatal: true
+  vars:
+    awg_node_role: gate
+  tasks:
+    - name: Ensure private directory for deployment lock
+      ansible.builtin.file:
+        path: /etc/amnezia/amneziawg
+        state: directory
+        mode: '0700'
+      when: not ansible_check_mode
+      tags: [always]
+    - name: Lock client mutations including prepare
+      ansible.builtin.command:
+        argv: [flock, /etc/amnezia/amneziawg/.cascade-clients.lock, mkdir, /etc/amnezia/amneziawg/.cascade-deploy]
+      when: not ansible_check_mode
+      tags: [always]
+    - name: Prepare and configure gate with guaranteed lock release
+      block:
+        - name: Check for an interrupted client transaction
+          ansible.builtin.stat:
+            path: /etc/amnezia/amneziawg/.cascade-client-transaction.json
+          register: awg_pending_transaction
+          tags: [always]
+        - name: Require client recovery before deployment
+          ansible.builtin.assert:
+            that: not awg_pending_transaction.stat.exists
+            fail_msg: Run /etc/amnezia/amneziawg/list-clients.sh to recover the interrupted client operation, then retry gate.yml.
+          tags: [always]
+        - name: Prepare this node and persistent keys
+          ansible.builtin.import_role:
+            name: amneziawg-cascade
+            tasks_from: prepare
+          tags: [prepare]
+        - name: Show this node's public link key
+          ansible.builtin.debug:
+            msg: "{{ awg_public_keys['link'] }}"
+          when: not ansible_check_mode
+          tags: [prepare]
+        - name: Install gate client manager
+          ansible.builtin.copy:
+            src: '{{ playbook_dir }}/../roles/amneziawg-cascade/files/cascade_clients.py'
+            dest: /etc/amnezia/amneziawg/cascade-clients.py
+            mode: '0700'
+          when: not ansible_check_mode
+        - name: Install client management commands beside gate configs
+          ansible.builtin.copy:
+            src: '{{ playbook_dir }}/../{{ item }}'
+            dest: '/etc/amnezia/amneziawg/{{ item }}'
+            mode: '0700'
+          loop: [add-client.sh, remove-client.sh, list-clients.sh]
+          when: not ansible_check_mode
+        - name: Configure this node's tunnels and routing
+          ansible.builtin.import_role:
+            name: amneziawg-cascade
+            tasks_from: configure
+          when: not ansible_check_mode
+      always:
+        - name: Release deployment lock
+          ansible.builtin.file:
+            path: /etc/amnezia/amneziawg/.cascade-deploy
+            state: absent
+          when: not ansible_check_mode
+          tags: [always]

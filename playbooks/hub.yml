@@ -1,0 +1,23 @@
+---
+- name: Configure German hub only
+  hosts: awg_hub
+  become: true
+  any_errors_fatal: true
+  vars:
+    awg_node_role: hub
+  tasks:
+    - name: Prepare this node and persistent keys
+      ansible.builtin.import_role:
+        name: amneziawg-cascade
+        tasks_from: prepare
+      tags: [prepare]
+    - name: Show this node's public link key
+      ansible.builtin.debug:
+        msg: "{{ awg_public_keys['link'] }}"
+      when: not ansible_check_mode
+      tags: [prepare]
+    - name: Configure this node's tunnels and routing
+      ansible.builtin.import_role:
+        name: amneziawg-cascade
+        tasks_from: configure
+      when: not ansible_check_mode

@@ -1,0 +1,147 @@
+---
+- name: Validate declared link public keys
+  ansible.builtin.assert:
+    that:
+      - awg_gate_link_public_key is match('^[A-Za-z0-9+/]{43}=$')
+      - awg_hub_link_public_key is match('^[A-Za-z0-9+/]{43}=$')
+      - awg_public_keys['link'] == (awg_gate_link_public_key if awg_node_role == 'gate' else awg_hub_link_public_key)
+    fail_msg: Run both nodes with --tags prepare, copy their public link keys into inventory, then run hub.yml and gate.yml separately.
+- name: Select managed interfaces
+  ansible.builtin.set_fact:
+    awg_interfaces: "{{ [awg_gate_link_interface, awg_client_interface] if awg_node_role == 'gate' else [awg_hub_interface] }}"
+- name: Check previous interface ownership record
+  ansible.builtin.stat:
+    path: /var/lib/awg-cascade/interfaces.json
+  register: awg_interface_record
+- name: Read previous interface names
+  ansible.builtin.slurp:
+    src: /var/lib/awg-cascade/interfaces.json
+  when: awg_interface_record.stat.exists
+  register: awg_previous_interfaces
+- name: Refuse implicit interface renaming
+  ansible.builtin.assert:
+    that:
+      - awg_previous_interfaces.content | b64decode | from_json == awg_interfaces
+    fail_msg: Interface names changed. Stop and disable previous interfaces before migrating; see README. Old services must not be left enabled.
+  when: awg_interface_record.stat.exists
+- name: Check interface config ownership
+  ansible.builtin.stat:
+    path: '/etc/amnezia/amneziawg/{{ item }}.conf'
+  loop: '{{ awg_interfaces }}'
+  register: awg_existing
+- name: Refuse to replace unmanaged interfaces
+  ansible.builtin.command:
+    argv: [grep, -Fxq, '# Managed by amneziawg-cascade. Clients are managed in inventory.', '/etc/amnezia/amneziawg/{{ item.item }}.conf']
+  loop: '{{ awg_existing.results }}'
+  when: item.stat.exists
+  changed_when: false
+- name: Load script-managed clients before rendering entry configuration
+  ansible.builtin.include_tasks: clients-state.yml
+  when: awg_node_role == 'gate'
+- name: Preview config updates without logging keys
+  ansible.builtin.template:
+    src: server.conf.j2
+    dest: '/etc/amnezia/amneziawg/{{ item }}.conf'
+    mode: '0600'
+    backup: true
+  loop: '{{ awg_interfaces }}'
+  check_mode: true
+  register: awg_config_preview
+  no_log: true
+  diff: false
+- name: Preview routing hook updates
+  ansible.builtin.template:
+    src: hooks.sh.j2
+    dest: '/usr/local/sbin/awg-cascade-{{ item }}'
+    mode: '0700'
+  loop: '{{ awg_interfaces }}'
+  check_mode: true
+  register: awg_hooks_preview
+- name: Stop using old hooks before replacing configuration
+  ansible.builtin.systemd_service:
+    name: 'awg-quick@{{ item.item }}'
+    state: stopped
+  loop: '{{ awg_existing.results | reverse | list }}'
+  when: item.stat.exists and (awg_config_preview.changed or awg_hooks_preview.changed)
+- name: Install routing hooks
+  ansible.builtin.template:
+    src: hooks.sh.j2
+    dest: '/usr/local/sbin/awg-cascade-{{ item }}'
+    mode: '0700'
+    validate: bash -n %s
+    backup: true
+  loop: '{{ awg_interfaces }}'
+- name: Install server configs
+  ansible.builtin.template:
+    src: server.conf.j2
+    dest: '/etc/amnezia/amneziawg/{{ item }}.conf'
+    mode: '0600'
+    backup: true
+  loop: '{{ awg_interfaces }}'
+  no_log: true
+  diff: false
+- name: Install RU prefix updater
+  ansible.builtin.template:
+    src: update-ru-routes.sh.j2
+    dest: /usr/local/sbin/awg-cascade-ru-routes
+    mode: '0700'
+    validate: bash -n %s
+  when: awg_node_role == 'gate'
+- name: Install manual RU prefix exceptions
+  ansible.builtin.copy:
+    content: "{{ awg_ru_extra | join('\n') }}\n"
+    dest: /etc/amnezia/amneziawg/cascade-ru-extra.list
+    mode: '0644'
+  when: awg_node_role == 'gate'
+  register: awg_extra_change
+- name: Install RU refresh units
+  ansible.builtin.template:
+    src: 'ru-refresh.{{ item }}.j2'
+    dest: '/etc/systemd/system/awg-cascade-ru.{{ item }}'
+    mode: '0644'
+  loop: [service, timer]
+  when: awg_node_role == 'gate'
+- name: Download initial RU prefixes or refresh changed exceptions
+  ansible.builtin.command: /usr/local/sbin/awg-cascade-ru-routes --refresh
+  args:
+    creates: "{{ omit if awg_extra_change.changed else '/var/lib/awg-cascade/awg_cascade_split.nft' }}"
+  when: awg_node_role == 'gate' and awg_ru_split
+- name: Enable or stop RU prefix timer
+  ansible.builtin.systemd_service:
+    name: awg-cascade-ru.timer
+    enabled: '{{ awg_ru_split | bool }}'
+    state: "{{ 'started' if awg_ru_split else 'stopped' }}"
+    daemon_reload: true
+  when: awg_node_role == 'gate'
+- name: Remove RU marking when disabled
+  ansible.builtin.command: nft delete table inet awg_cascade_split
+  register: awg_remove_marking
+  failed_when: awg_remove_marking.rc not in [0, 1]
+  changed_when: awg_remove_marking.rc == 0
+  when: awg_node_role == 'gate' and not awg_ru_split
+- name: Generate client profiles on gate only
+  ansible.builtin.template:
+    src: client.conf.j2
+    dest: '/etc/amnezia/amneziawg/cascade-clients/{{ item.name }}.conf'
+    mode: '0600'
+  loop: '{{ awg_inventory_clients + awg_dynamic_clients }}'
+  when: awg_node_role == 'gate'
+  no_log: true
+  diff: false
+- name: Start link before client entry and enable autostart
+  ansible.builtin.systemd_service:
+    name: 'awg-quick@{{ item }}'
+    state: started
+    enabled: true
+  loop: '{{ awg_interfaces }}'
+- name: Verify configured listening ports
+  ansible.builtin.command: 'awg show {{ item }} listen-port'
+  loop: '{{ awg_interfaces }}'
+  register: awg_listen
+  changed_when: false
+  failed_when: awg_listen.stdout | int != (awg_hub_port | int if awg_node_role == 'hub' else (awg_client_port | int if item == awg_client_interface else awg_gate_link_port | int))
+- name: Record managed interface names
+  ansible.builtin.copy:
+    content: '{{ awg_interfaces | to_json }}'
+    dest: /var/lib/awg-cascade/interfaces.json
+    mode: '0600'
