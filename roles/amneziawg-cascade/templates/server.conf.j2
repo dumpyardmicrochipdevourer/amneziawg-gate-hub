@@ -6,9 +6,10 @@ Address = {{ awg_client_subnet }}.1/24
 ListenPort = {{ awg_client_port }}
 {% set obfuscation = awg_entry_obfuscation %}
 {% else %}
+{% set link = awg_links[item] %}
 PrivateKey = {{ awg_private_keys['link'] }}
-Address = {{ awg_link_subnet }}.{{ '2' if awg_node_role == 'gate' else '1' }}/30
-ListenPort = {{ awg_gate_link_port if awg_node_role == 'gate' else awg_hub_port }}
+Address = {{ link.gate_address if awg_node_role == 'gate' else link.hub_address }}/30
+ListenPort = {{ link.gate_port if awg_node_role == 'gate' else link.hub_port }}
 Table = off
 {% set obfuscation = awg_link_obfuscation %}
 {% endif %}
@@ -38,13 +39,14 @@ AllowedIPs = {{ awg_client_subnet }}.{{ client.octet }}/32
 
 {% endfor %}
 {% else %}
+{% set link = awg_links[item] %}
 [Peer]
-PublicKey = {{ awg_hub_link_public_key if awg_node_role == 'gate' else awg_gate_link_public_key }}
+PublicKey = {{ link.public_key if awg_node_role == 'gate' else awg_gate_link_public_key }}
 {% if awg_node_role == 'gate' %}
-Endpoint = {{ hostvars[awg_hub].ansible_host }}:{{ awg_hub_port }}
+Endpoint = {{ link.host }}:{{ link.hub_port }}
 AllowedIPs = 0.0.0.0/0
 {% else %}
-AllowedIPs = {{ awg_link_subnet }}.2/32
+AllowedIPs = {{ link.gate_address }}/32
 {% endif %}
 PersistentKeepalive = 25
 {% endif %}

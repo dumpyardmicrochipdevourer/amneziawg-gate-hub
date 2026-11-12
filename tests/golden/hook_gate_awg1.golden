@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# All rules belong only to this interface. Never flush global routing/firewall.
+action=${1:?up or down}
+[[ $action == up || $action == down ]] || exit 2
+ipt() { iptables -w 10 "$@"; }
+# Reverse path to an internet source is WAN; replies arrive on the AWG link.
+if [[ $action == up ]]; then
+    sysctl -w net.ipv4.conf.awg1.rp_filter=2 >/dev/null
+fi
+if [[ $action == up ]]; then
+    ip route replace default dev awg1 metric 10 table 10010
+    ipt -I INPUT -p udp --dport 51822 -j ACCEPT
+    ipt -t nat -A POSTROUTING -s 10.2.0.0/24 -o awg1 -j MASQUERADE
+else
+    ip route del default dev awg1 metric 10 table 10010 2>/dev/null || true
+    ipt -D INPUT -p udp --dport 51822 -j ACCEPT || true
+    ipt -t nat -D POSTROUTING -s 10.2.0.0/24 -o awg1 -j MASQUERADE || true
+fi

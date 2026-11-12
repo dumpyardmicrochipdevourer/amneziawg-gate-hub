@@ -1,5 +1,5 @@
 ---
-- name: Configure German hub only
+- name: Configure hubs only
   hosts: awg_hub
   become: true
   any_errors_fatal: true

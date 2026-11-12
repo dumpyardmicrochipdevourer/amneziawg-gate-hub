@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# All rules belong only to this interface. Never flush global routing/firewall.
+action=${1:?up or down}
+[[ $action == up || $action == down ]] || exit 2
+ipt() { iptables -w 10 "$@"; }
+# Reverse path to an internet source is WAN; replies arrive on the AWG link.
+if [[ $action == up ]]; then
+    sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null
+fi
+chain=AWGC_CLIENTS
+# Rules of these priorities belong to this interface; delete leftovers without reading state.
+flush_rules() { while ip -4 rule del priority "$1" iif awg0 2>/dev/null; do :; done; }
+# Shared with awg-cascade-rules: no client sync while rules are being replaced.
+lock_rules() { exec 9>>/etc/amnezia/amneziawg/.cascade-rules.lock && flock -w 30 9; }
+if [[ $action == up ]]; then
+    ipt -N "$chain" 2>/dev/null || true
+    ipt -F "$chain"
+    ipt -A "$chain" -i awg0 -d 10.78.0.0/24 -j DROP
+    ipt -A "$chain" -i awg0 -o awg1 -s 10.2.0.0/24 -j ACCEPT
+    ipt -A "$chain" -i awg1 -o awg0 -d 10.2.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt -A "$chain" -i awg0 -o awghub2 -s 10.2.0.0/24 -j ACCEPT
+    ipt -A "$chain" -i awghub2 -o awg0 -d 10.2.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt -A "$chain" -i awg0 -o eth0 -s 10.2.0.0/24 -m mark --mark 0x64 -j ACCEPT
+    ipt -A "$chain" -i eth0 -o awg0 -d 10.2.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt -A "$chain" -i awg0 -j DROP
+    ipt -A "$chain" -o awg0 -j DROP
+    ipt -C FORWARD -j "$chain" 2>/dev/null || ipt -I FORWARD 1 -j "$chain"
+    ipt -C INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || ipt -I INPUT -p udp --dport 51820 -j ACCEPT
+    # Remain when a link is down, preventing fallback to another hub or gate's main table.
+    ip route replace unreachable default metric 32760 table 10019
+    ip route replace unreachable default metric 32760 table 10010
+    ip route replace unreachable default metric 32760 table 10020
+    lock_rules
+    flush_rules 10010
+    ip rule add from 10.2.0.0/24 iif awg0 priority 10010 lookup 10019
+    flush_rules 10005
+    # Fail closed: without valid per-client rules the interface must not come up.
+    /usr/local/sbin/awg-cascade-rules --no-lock
+    exec 9>&-
+    flush_rules 10000
+    /usr/local/sbin/awg-cascade-ru-routes --apply
+    ip route replace default via 203.0.113.1 dev eth0 onlink table 10011
+    ip rule add from 10.2.0.0/24 iif awg0 fwmark 0x64 priority 10000 lookup 10011
+    ipt -t nat -A POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE
+else
+    lock_rules || true
+    flush_rules 10005
+    flush_rules 10010
+    exec 9>&-
+    ip route del unreachable default metric 32760 table 10019 2>/dev/null || true
+    ip route del unreachable default metric 32760 table 10010 2>/dev/null || true
+    ip route del unreachable default metric 32760 table 10020 2>/dev/null || true
+    flush_rules 10000
+    ip route del default via 203.0.113.1 dev eth0 table 10011 2>/dev/null || true
+    ipt -t nat -D POSTROUTING -s 10.2.0.0/24 -o eth0 -j MASQUERADE || true
+    nft delete table inet awg_cascade_split 2>/dev/null || true
+    ipt -D INPUT -p udp --dport 51820 -j ACCEPT || true
+    ipt -D FORWARD -j "$chain" || true
+    ipt -F "$chain" || true
+    ipt -X "$chain" || true
+fi

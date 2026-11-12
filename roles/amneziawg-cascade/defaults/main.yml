@@ -7,6 +7,9 @@ awg_gate_link_port: 51822
 awg_hub_port: 51821
 awg_client_subnet: 10.2.0
 awg_link_subnet: 10.78.0
+# Hub used by clients without an explicit hub; empty means the hub with awg_hub_index 1.
+# Clients created by older script versions have no hub in the registry and follow this value.
+awg_default_hub: ''
 awg_mtu: 1280
 awg_dns: 1.1.1.1
 awg_route_table: 10010

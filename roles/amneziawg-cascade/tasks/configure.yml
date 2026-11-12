@@ -1,14 +1,30 @@
 ---
-- name: Validate declared link public keys
+- name: Install per-client routing rule synchronizer before any settings that need it
+  ansible.builtin.copy:
+    src: cascade_rules.py
+    dest: /usr/local/sbin/awg-cascade-rules
+    mode: '0700'
+    validate: python3 -m py_compile %s
+  when: awg_node_role == 'gate'
+- name: Validate declared link public keys on gate
+  ansible.builtin.assert:
+    that:
+      - awg_public_keys['link'] == awg_gate_link_public_key
+      - awg_topology | awg_cascade_check_link_keys(awg_gate_link_public_key)
+    fail_msg: Run all nodes with --tags prepare, copy their public link keys into inventory (hub keys into each hub's host vars), then run hub.yml and gate.yml separately.
+  when: awg_node_role == 'gate'
+- name: Validate declared link public keys on hub
   ansible.builtin.assert:
     that:
       - awg_gate_link_public_key is match('^[A-Za-z0-9+/]{43}=$')
       - awg_hub_link_public_key is match('^[A-Za-z0-9+/]{43}=$')
-      - awg_public_keys['link'] == (awg_gate_link_public_key if awg_node_role == 'gate' else awg_hub_link_public_key)
-    fail_msg: Run both nodes with --tags prepare, copy their public link keys into inventory, then run hub.yml and gate.yml separately.
-- name: Select managed interfaces
+      - awg_public_keys['link'] == awg_hub_link_public_key
+    fail_msg: Run all nodes with --tags prepare, copy their public link keys into inventory (hub keys into each hub's host vars), then run hub.yml and gate.yml separately.
+  when: awg_node_role == 'hub'
+- name: Select managed interfaces and links
   ansible.builtin.set_fact:
-    awg_interfaces: "{{ [awg_gate_link_interface, awg_client_interface] if awg_node_role == 'gate' else [awg_hub_interface] }}"
+    awg_interfaces: "{{ awg_topology.gate_interfaces if awg_node_role == 'gate' else [awg_hub_interface] }}"
+    awg_links: "{{ awg_topology | awg_cascade_links(awg_node_role, inventory_hostname, awg_hub_interface) }}"
 - name: Check previous interface ownership record
   ansible.builtin.stat:
     path: /var/lib/awg-cascade/interfaces.json
@@ -18,10 +34,10 @@
     src: /var/lib/awg-cascade/interfaces.json
   when: awg_interface_record.stat.exists
   register: awg_previous_interfaces
-- name: Refuse implicit interface renaming
+- name: Refuse implicit interface renaming or removal
   ansible.builtin.assert:
     that:
-      - awg_previous_interfaces.content | b64decode | from_json == awg_interfaces
+      - awg_previous_interfaces.content | b64decode | from_json | awg_cascade_check_interfaces(awg_interfaces)
     fail_msg: Interface names changed. Stop and disable previous interfaces before migrating; see README. Old services must not be left enabled.
   when: awg_interface_record.stat.exists
 - name: Check interface config ownership
@@ -57,12 +73,21 @@
   loop: '{{ awg_interfaces }}'
   check_mode: true
   register: awg_hooks_preview
-- name: Stop using old hooks before replacing configuration
+- name: Start list of interfaces whose config or hook changes
+  ansible.builtin.set_fact:
+    awg_changed_interfaces: []
+- name: Select interfaces whose config or hook changes
+  ansible.builtin.set_fact:
+    awg_changed_interfaces: "{{ awg_changed_interfaces + [item] if (awg_config_preview.results[idx].changed or awg_hooks_preview.results[idx].changed) else awg_changed_interfaces }}"
+  loop: '{{ awg_interfaces }}'
+  loop_control:
+    index_var: idx
+- name: Stop only interfaces whose config or hook changes
   ansible.builtin.systemd_service:
     name: 'awg-quick@{{ item.item }}'
     state: stopped
   loop: '{{ awg_existing.results | reverse | list }}'
-  when: item.stat.exists and (awg_config_preview.changed or awg_hooks_preview.changed)
+  when: item.stat.exists and item.item in awg_changed_interfaces
 - name: Install routing hooks
   ansible.builtin.template:
     src: hooks.sh.j2
@@ -124,22 +149,29 @@
     src: client.conf.j2
     dest: '/etc/amnezia/amneziawg/cascade-clients/{{ item.name }}.conf'
     mode: '0600'
-  loop: '{{ awg_inventory_clients + awg_dynamic_clients }}'
+  loop: '{{ awg_effective_clients.inventory + awg_effective_clients.dynamic }}'
   when: awg_node_role == 'gate'
   no_log: true
   diff: false
-- name: Start link before client entry and enable autostart
+- name: Start links before client entry and enable autostart
   ansible.builtin.systemd_service:
     name: 'awg-quick@{{ item }}'
     state: started
     enabled: true
   loop: '{{ awg_interfaces }}'
+- name: Synchronize per-client routing rules with the bindings file
+  ansible.builtin.command: /usr/local/sbin/awg-cascade-rules
+  register: awg_sync
+  changed_when: awg_sync.stdout | trim != 'added=0 removed=0'
+  when: awg_node_role == 'gate'
 - name: Verify configured listening ports
   ansible.builtin.command: 'awg show {{ item }} listen-port'
   loop: '{{ awg_interfaces }}'
   register: awg_listen
   changed_when: false
-  failed_when: awg_listen.stdout | int != (awg_hub_port | int if awg_node_role == 'hub' else (awg_client_port | int if item == awg_client_interface else awg_gate_link_port | int))
+  vars:
+    awg_expected_port: "{{ awg_client_port | int if (awg_node_role == 'gate' and item == awg_client_interface) else (awg_links[item].gate_port if awg_node_role == 'gate' else awg_links[item].hub_port) }}"
+  failed_when: awg_listen.stdout | int != awg_expected_port | int
 - name: Record managed interface names
   ansible.builtin.copy:
     content: '{{ awg_interfaces | to_json }}'

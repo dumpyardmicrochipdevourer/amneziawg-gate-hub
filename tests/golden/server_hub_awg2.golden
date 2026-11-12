@@ -1,0 +1,23 @@
+# Managed by amneziawg-cascade. Clients are managed in inventory.
+[Interface]
+PrivateKey = link-private-key
+Address = 10.78.0.1/30
+ListenPort = 51821
+Table = off
+MTU = 1280
+Jc = 6
+Jmin = 8
+Jmax = 80
+S1 = 21
+S2 = 126
+H1 = 664839111
+H2 = 1485638111
+H3 = 1457145111
+H4 = 1956374111
+PostUp = /usr/local/sbin/awg-cascade-awg2 up
+PostDown = /usr/local/sbin/awg-cascade-awg2 down
+
+[Peer]
+PublicKey = GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG=
+AllowedIPs = 10.78.0.2/32
+PersistentKeepalive = 25

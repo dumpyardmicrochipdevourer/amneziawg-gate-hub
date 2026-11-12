@@ -1,67 +1,68 @@
 ---
-- name: Validate two-node inventory
-  ansible.builtin.assert:
-    that:
-      - groups.get('awg_gate', []) | length == 1
-      - groups.get('awg_hub', []) | length == 1
-      - groups['awg_gate'][0] != groups['awg_hub'][0]
-      - hostvars[groups['awg_gate'][0]].ansible_host != hostvars[groups['awg_hub'][0]].ansible_host
-- name: Validate platform and settings
+- name: Validate platform
   ansible.builtin.assert:
     that:
       - ansible_facts.distribution == 'Ubuntu'
       - ansible_facts.distribution_version in ['22.04', '24.04']
       - ansible_facts.architecture == 'x86_64'
       - ansible_facts.virtualization_type not in ['lxc', 'openvz', 'docker', 'container']
-      - awg_client_subnet is match('^10\.[0-9]{1,3}\.[0-9]{1,3}$')
-      - awg_link_subnet is match('^10\.[0-9]{1,3}\.[0-9]{1,3}$')
-      - awg_client_subnet != awg_link_subnet
-      - awg_route_table | int >= 10000
-      - awg_ru_table | int >= 10000
-      - awg_route_table != awg_ru_table
-      - awg_clients | map(attribute='name') | unique | length == awg_clients | length
-      - awg_clients | map(attribute='octet') | map('int') | unique | length == awg_clients | length
-- name: Validate subnet octets
-  ansible.builtin.assert:
-    that:
-      - item | int >= 0
-      - item | int <= 255
-  loop: "{{ awg_client_subnet.split('.')[1:] + awg_link_subnet.split('.')[1:] }}"
-- name: Validate clients
-  ansible.builtin.assert:
-    that:
-      - item.name is match('^[A-Za-z0-9_-]{1,32}$')
-      - item.octet | int >= 2
-      - item.octet | int <= 254
-      - item.octet | string == item.octet | int | string
-  loop: '{{ awg_clients }}'
-- name: Validate interface names
-  ansible.builtin.assert:
-    that:
-      - item is match('^[A-Za-z][A-Za-z0-9_-]{0,14}$')
-  loop: '{{ [awg_client_interface, awg_gate_link_interface, awg_hub_interface] }}'
-- name: Validate ports and separate gate interfaces
-  ansible.builtin.assert:
-    that:
-      - awg_client_interface != awg_gate_link_interface
-      - awg_client_port | int != awg_gate_link_port | int
-      - item | int >= 1
-      - item | int <= 65535
-  loop: '{{ [awg_client_port, awg_gate_link_port, awg_hub_port] }}'
+- name: Start gate and hub input lists
+  ansible.builtin.set_fact:
+    awg_gate_inputs: []
+    awg_hub_inputs: []
+- name: Collect gate inputs
+  ansible.builtin.set_fact:
+    awg_gate_inputs: "{{ awg_gate_inputs + [{'name': item, 'host': hostvars[item].ansible_host}] }}"
+  loop: "{{ groups.get('awg_gate', []) }}"
+- name: Collect hub inputs
+  ansible.builtin.set_fact:
+    awg_hub_inputs: "{{ awg_hub_inputs + [{'name': item, 'host': hostvars[item].ansible_host, 'index': hostvars[item].awg_hub_index | default(none), 'public_key': hostvars[item].awg_hub_link_public_key | default(''), 'hub_port': hostvars[item].awg_hub_port | default(awg_hub_port)}] }}"
+  loop: "{{ groups.get('awg_hub', []) }}"
+- name: Collect topology settings
+  ansible.builtin.set_fact:
+    awg_topology_settings:
+      gates: '{{ awg_gate_inputs }}'
+      client_interface: '{{ awg_client_interface }}'
+      client_port: '{{ awg_client_port }}'
+      client_subnet: '{{ awg_client_subnet }}'
+      link_interface: '{{ awg_gate_link_interface }}'
+      link_port: '{{ awg_gate_link_port }}'
+      link_subnet: '{{ awg_link_subnet }}'
+      hub_interface: '{{ awg_hub_interface }}'
+      route_table: '{{ awg_route_table }}'
+      ru_table: '{{ awg_ru_table }}'
+      default_hub: "{{ awg_default_hub | default('') }}"
+- name: Validate topology of gate and hubs
+  ansible.builtin.set_fact:
+    awg_topology: "{{ awg_hub_inputs | awg_cascade_topology(awg_topology_settings) }}"
+- name: Validate inventory clients
+  ansible.builtin.set_fact:
+    awg_checked_clients: "{{ awg_clients | awg_cascade_check_clients(awg_topology) }}"
 - name: Select outbound interface and node names
   ansible.builtin.set_fact:
     awg_wan: '{{ awg_egress_interface | default(ansible_facts.default_ipv4.interface) }}'
     awg_gateway: '{{ awg_egress_gateway | default(ansible_facts.default_ipv4.gateway) }}'
     awg_gate: "{{ groups['awg_gate'][0] }}"
-    awg_hub: "{{ groups['awg_hub'][0] }}"
 - name: Validate network arguments
   ansible.builtin.assert:
     that:
       - awg_wan is match('^[A-Za-z0-9_.:-]{1,15}$')
-      - awg_wan not in [awg_client_interface, awg_gate_link_interface, awg_hub_interface]
+      - awg_wan not in awg_topology.gate_interfaces + [awg_hub_interface]
       - awg_gateway is match('^[0-9.]+$')
-      - hostvars[awg_gate].ansible_host is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
-      - hostvars[awg_hub].ansible_host is match('^[A-Za-z0-9][A-Za-z0-9.-]*$')
+- name: Check persistent client registry
+  ansible.builtin.stat:
+    path: /etc/amnezia/amneziawg/cascade-clients.json
+  register: awg_registry_file
+  when: awg_node_role == 'gate'
+- name: Read persistent client registry
+  ansible.builtin.slurp:
+    src: /etc/amnezia/amneziawg/cascade-clients.json
+  when: awg_node_role == 'gate' and awg_registry_file.stat.exists
+  register: awg_registry_raw
+- name: Validate effective clients including the script-created registry
+  ansible.builtin.set_fact:
+    awg_effective_clients: "{{ awg_clients | awg_cascade_effective_clients((awg_registry_raw.content | b64decode | from_json) if awg_registry_file.stat.exists else none, awg_topology) }}"
+  when: awg_node_role == 'gate'
 - name: Install kernel build prerequisites
   ansible.builtin.apt:
     name:

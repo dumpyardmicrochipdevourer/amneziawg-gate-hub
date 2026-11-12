@@ -1,15 +1,19 @@
-# shared configuration for both vps
+# shared configuration for gate and hubs
 ---
 all:
   vars:
     ansible_user: root
     ansible_ssh_private_key_file: ~/.ssh/infra_key
     awg_gate_link_public_key: ''  # from gate.yml --tags prepare
-    awg_hub_link_public_key: ''   # from hub.yml --tags prepare
     awg_ru_split: true
+    # hub for clients without the `hub` field; default: the hub with awg_hub_index 1.
+    # WARNING: registry clients created by an older version have no hub recorded
+    # and will move to the new hub if you change this value.
+    # awg_default_hub: hub_de
     awg_clients:
-      - {name: testcfg1, octet: 2}
-      - {name: testcfg2, octet: 3}
+      - {name: testcfg1, octet: 2}                 # default hub
+      - {name: testcfg2, octet: 3, hub: hub_de}    # explicit hub
+      # - {name: testcfg3, octet: 4, hub: hub_us}  # after hub_us is deployed
   children:
     awg_gate:
       hosts:
@@ -19,3 +23,10 @@ all:
       hosts:
         hub_de:
           ansible_host: 203.0.113.20  # replace: hub vps
+          awg_hub_index: 1            # unique, 1..64, never change after deploy
+          awg_hub_link_public_key: ''  # from hub.yml --limit hub_de --tags prepare
+        # Second hub: add only when the server already exists.
+        # hub_us:
+        #   ansible_host: 198.51.100.30  # replace: second hub vps
+        #   awg_hub_index: 2
+        #   awg_hub_link_public_key: ''  # from hub.yml --limit hub_us --tags prepare
