@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+
+# Real server addresses and keys of this deployment
+inventory/hosts.yml
+
+# Downloaded client profiles contain private keys
+*.conf

@@ -1,0 +1,3 @@
+# Files are copied to Linux servers as-is; CRLF breaks shebangs there.
+* text=auto eol=lf
+*.pyc binary
