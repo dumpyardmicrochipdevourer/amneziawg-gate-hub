@@ -49,6 +49,20 @@ chmod 600 testcfg1.conf
 Список обновляется ежедневно; при ошибке обновления сохраняется предыдущий.
 
 
+## systemd-networkd
+
+Правила `ip rule` и маршруты в таблицах 10010/10011 ставят хуки `awg-quick`.
+По умолчанию `systemd-networkd` при перезапуске (например, needrestart после
+unattended-upgrades) удаляет чужие правила и маршруты: туннель подключается,
+но трафик клиентов отбрасывается. Поэтому роль кладёт на ноды
+`/etc/systemd/networkd.conf.d/10-awg-cascade.conf` с
+`ManageForeignRoutingPolicyRules=no` и `ManageForeignRoutes=no`.
+
+Если правила уже пропали (`ip rule` без строк `10000` и `10010`), на gate:
+```bash
+systemctl restart awg-quick@awg1 && systemctl restart awg-quick@awg0
+```
+
 ## client managment
 
 ```bash
