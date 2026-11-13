@@ -63,6 +63,20 @@
   ansible.builtin.set_fact:
     awg_effective_clients: "{{ awg_clients | awg_cascade_effective_clients((awg_registry_raw.content | b64decode | from_json) if awg_registry_file.stat.exists else none, awg_topology) }}"
   when: awg_node_role == 'gate'
+- name: Ensure apt lists directory exists
+  ansible.builtin.file:
+    path: /var/lib/apt/lists/partial
+    state: directory
+    mode: '0755'
+- name: Force apt cache update and ensure universe repo is active
+  ansible.builtin.shell: |
+    apt-get update
+    if ! grep -rn "universe" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -v "^#" >/dev/null; then
+      echo "deb http://archive.ubuntu.com/ubuntu {{ ansible_facts.distribution_release }} universe" > /etc/apt/sources.list.d/universe.list
+      echo "deb http://archive.ubuntu.com/ubuntu {{ ansible_facts.distribution_release }}-updates universe" >> /etc/apt/sources.list.d/universe.list
+      apt-get update
+    fi
+  changed_when: false
 - name: Install kernel build prerequisites
   ansible.builtin.apt:
     name:
@@ -73,8 +87,6 @@
       - dkms
       - "linux-headers-{{ ansible_facts.kernel }}"
       - iptables
-    update_cache: true
-    cache_valid_time: 3600
 
 - name: Enable Ubuntu sources for DKMS kernel source lookup
   ansible.builtin.apt_repository:
@@ -100,7 +112,6 @@
     - name: Load module and fail early if DKMS or Secure Boot prevents loading
       ansible.builtin.command: modprobe amneziawg
       changed_when: false
-
 
     - name: Install routing prerequisites
       ansible.builtin.apt:
