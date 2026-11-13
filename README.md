@@ -109,6 +109,22 @@ journalctl -u awg-quick@awg0 -n 50
 
 Откат: верни прежний коммит репозитория и снова выполни `gate.yml`.
 
+## systemd-networkd
+
+Правила `ip rule` (приоритеты 10000, 10005, 10010) и маршруты в таблицах hub,
+RU и заглушки ставят хуки `awg-quick` и `awg-cascade-rules`. По умолчанию
+`systemd-networkd` при перезапуске (например, needrestart после
+unattended-upgrades) удаляет чужие правила и маршруты: туннель подключается,
+но трафик клиентов отбрасывается. Поэтому роль кладёт на ноды
+`/etc/systemd/networkd.conf.d/10-awg-cascade.conf` с
+`ManageForeignRoutingPolicyRules=no` и `ManageForeignRoutes=no`.
+
+Если правила уже пропали (`ip rule` без строк `10000`, `10005` и `10010`),
+на gate перезапусти сначала все линки (`awg1`, `awghubN`), затем `awg0`:
+```bash
+systemctl restart awg-quick@awg1 && systemctl restart awg-quick@awg0
+```
+
 ## Добавить hub
 
 Порядок для нового hub (пример `hub_us`):

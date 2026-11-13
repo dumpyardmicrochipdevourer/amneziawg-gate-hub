@@ -51,6 +51,24 @@
   loop: '{{ awg_existing.results }}'
   when: item.stat.exists
   changed_when: false
+- name: Create systemd-networkd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/networkd.conf.d
+    state: directory
+    mode: '0755'
+# A networkd restart (e.g. by needrestart after unattended-upgrades) would
+# otherwise delete the hooks' ip rules and table routes and drop client traffic.
+# Read on the next networkd start; never restart networkd here, that would
+# remove the rules on its own.
+- name: Keep systemd-networkd from removing cascade ip rules and routes
+  ansible.builtin.copy:
+    content: |
+      # Managed by amneziawg-cascade.
+      [Network]
+      ManageForeignRoutingPolicyRules=no
+      ManageForeignRoutes=no
+    dest: /etc/systemd/networkd.conf.d/10-awg-cascade.conf
+    mode: '0644'
 - name: Load script-managed clients before rendering entry configuration
   ansible.builtin.include_tasks: clients-state.yml
   when: awg_node_role == 'gate'
